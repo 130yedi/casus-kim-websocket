@@ -14,6 +14,36 @@ const wss = new WebSocket.Server({
 
 console.log(`WebSocket sunucusu ${PORT} portunda başlatılıyor...`);
 
+// Heartbeat sistemi - ölü bağlantıları temizle
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) {
+      console.log('Ölü bağlantı tespit edildi, kapatılıyor...');
+      // Oyuncuyu bul ve temizle
+      for (const [playerId, connection] of playerConnections.entries()) {
+        if (connection === ws) {
+          handlePlayerDisconnect(playerId);
+          break;
+        }
+      }
+      return ws.terminate();
+    }
+    
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch (error) {
+      console.error('Ping gönderme hatası:', error);
+    }
+  });
+}, 30000); // 30 saniyede bir kontrol et
+
+// Sunucu kapanırken temizlik yap
+process.on('SIGTERM', () => {
+  clearInterval(heartbeatInterval);
+  wss.close();
+});
+
 // Oyun odaları ve oyuncular
 const gameRooms = new Map();
 const playerConnections = new Map(); // playerId -> WebSocket connection
@@ -73,27 +103,38 @@ function broadcastToRoom(roomCode, message, excludePlayerId = null) {
 
 // Oyuncu bağlantısı kesildiğinde temizle
 function handlePlayerDisconnect(playerId) {
-  playerConnections.delete(playerId);
+  console.log(`Oyuncu bağlantısı kesildi: ${playerId}`);
+  
+  const connection = playerConnections.get(playerId);
+  if (connection) {
+    playerConnections.delete(playerId);
+  }
   
   // Oyuncunun hangi odada olduğunu bul
   for (const [roomCode, room] of gameRooms.entries()) {
     const playerIndex = room.players.findIndex(p => p.id === playerId);
     if (playerIndex !== -1) {
+      const playerName = room.players[playerIndex].name;
       room.players.splice(playerIndex, 1);
+      
+      console.log(`Oyuncu odadan çıkarıldı: ${playerName} (${playerId}) -> Oda: ${roomCode}`);
       
       // Oda boş ise sil
       if (room.players.length === 0) {
+        console.log(`Oda silindi: ${roomCode} (boş oda)`);
         gameRooms.delete(roomCode);
       } else {
         // Host ayrıldıysa yeni host seç
         if (room.hostId === playerId && room.players.length > 0) {
           room.hostId = room.players[0].id;
+          console.log(`Yeni host seçildi: ${room.players[0].name} (${room.hostId})`);
         }
         
         // Diğer oyunculara bildir
-        broadcastToRoom(roomCode, {
+        const updateMessage = {
           type: 'playerLeft',
           playerId: playerId,
+          playerName: playerName,
           room: {
             code: roomCode,
             players: room.players,
@@ -101,7 +142,10 @@ function handlePlayerDisconnect(playerId) {
             state: room.state,
             category: room.category
           }
-        });
+        };
+        
+        console.log(`Oyuncu ayrılma bildirimi gönderiliyor:`, updateMessage);
+        broadcastToRoom(roomCode, updateMessage);
       }
       break;
     }
@@ -111,6 +155,12 @@ function handlePlayerDisconnect(playerId) {
 // WebSocket bağlantı yönetimi
 wss.on('connection', (ws) => {
   console.log('Yeni bağlantı kuruldu');
+  
+  // Bağlantı için timeout ayarla
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
   
   ws.on('message', (data) => {
     try {
@@ -147,7 +197,12 @@ wss.on('connection', (ws) => {
           break;
         case 'ping':
           // Heartbeat ping'ine pong ile yanıt ver
-          ws.send(JSON.stringify({ type: 'pong' }));
+          ws.isAlive = true;
+          try {
+            ws.send(JSON.stringify({ type: 'pong' }));
+          } catch (error) {
+            console.error('Pong gönderme hatası:', error);
+          }
           break;
         default:
           console.log('Bilinmeyen mesaj tipi:', message.type);
@@ -256,11 +311,33 @@ function handleJoinRoom(ws, message) {
       return;
     }
     
+    // Aynı isimde oyuncu var mı kontrol et
+    const existingPlayer = room.players.find(p => p.name.toLowerCase() === message.playerName.toLowerCase());
+    if (existingPlayer) {
+      console.log(`Aynı isimde oyuncu zaten var: ${message.playerName}`);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Bu isimde bir oyuncu zaten odada'
+      }));
+      return;
+    }
+    
+    // Maksimum oyuncu sayısı kontrolü
+    if (room.players.length >= (room.maxPlayers || 8)) {
+      console.log(`Oda dolu: ${room.players.length}/${room.maxPlayers || 8}`);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Oda dolu'
+      }));
+      return;
+    }
+    
     const playerId = uuidv4();
     const player = {
       id: playerId,
       name: message.playerName,
-      isConnected: true
+      isConnected: true,
+      joinedAt: new Date()
     };
     
     room.players.push(player);
@@ -356,50 +433,101 @@ function handleStartGame(ws, message) {
 
 // Kelimeyi göster
 function handleShowWord(ws, message) {
-  const room = gameRooms.get(message.roomCode);
-  
-  if (!room || room.hostId !== message.playerId) {
+  try {
+    const room = gameRooms.get(message.roomCode);
+    
+    if (!room) {
+      console.log(`Oda bulunamadı: ${message.roomCode}`);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Oda bulunamadı'
+      }));
+      return;
+    }
+    
+    if (room.hostId !== message.playerId) {
+      console.log(`Yetkisiz kelime gösterme denemesi: ${message.playerId} (Host: ${room.hostId})`);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Bu işlemi sadece host yapabilir'
+      }));
+      return;
+    }
+    
+    if (room.state !== GameState.STARTING) {
+      console.log(`Yanlış durum: ${room.state}, kelime gösterilemez`);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Kelime sadece oyun başlangıcında gösterilebilir'
+      }));
+      return;
+    }
+    
+    room.state = GameState.WORD_SHOWN;
+    
+    console.log(`Kelime gösteriliyor: "${room.word}", Kategori: ${room.category}, Casuslar: [${room.spies.join(', ')}]`);
+    
+    // Her oyuncuya rolüne göre mesaj gönder
+    let successCount = 0;
+    let failCount = 0;
+    
+    room.players.forEach(player => {
+      const connection = playerConnections.get(player.id);
+      const isSpy = room.spies.includes(player.id);
+      
+      if (connection && connection.readyState === WebSocket.OPEN) {
+        try {
+          const playerMessage = {
+            type: 'wordShown',
+            word: isSpy ? null : room.word,
+            category: room.category,
+            isSpy: isSpy,
+            spyCount: room.showSpyCountToPlayers ? room.spyCount : null,
+            otherSpies: (isSpy && room.allowSpyDiscussion) ? 
+              room.spies.filter(spyId => spyId !== player.id)
+                       .map(spyId => room.players.find(p => p.id === spyId)?.name).filter(Boolean) : [],
+            spyHintsEnabled: room.spyHintsEnabled,
+            room: {
+              code: room.code,
+              players: room.players,
+              hostId: room.hostId,
+              state: room.state,
+              category: room.category
+            }
+          };
+          
+          connection.send(JSON.stringify(playerMessage));
+          successCount++;
+          console.log(`✅ ${player.name} (${isSpy ? 'CASUS' : 'NORMAL'}): Mesaj gönderildi`);
+        } catch (error) {
+          failCount++;
+          console.error(`❌ ${player.name}: Mesaj gönderme hatası:`, error);
+        }
+      } else {
+        failCount++;
+        console.log(`❌ ${player.name}: Bağlantı yok veya kapalı`);
+        // Bağlantısı olmayan oyuncuyu işaretle
+        player.isConnected = false;
+      }
+    });
+    
+    console.log(`Kelime gösterme tamamlandı: ${successCount} başarılı, ${failCount} başarısız`);
+    
+    // Eğer hiç kimseye gönderilemezse hata döndür
+    if (successCount === 0) {
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Hiçbir oyuncuya mesaj gönderilemedi'
+      }));
+    }
+    
+  } catch (error) {
+    console.error('Kelime gösterme hatası:', error);
     ws.send(JSON.stringify({
       type: 'error',
-      message: 'Bu işlemi sadece host yapabilir'
+      message: 'Kelime gösterilirken hata oluştu: ' + error.message
     }));
-    return;
   }
-  
-  room.state = GameState.WORD_SHOWN;
-  
-  // Her oyuncuya rolüne göre mesaj gönder
-  console.log(`Kelime gösteriliyor: ${room.word}, Casuslar: ${room.spies.join(', ')}`);
-  room.players.forEach(player => {
-    const connection = playerConnections.get(player.id);
-    const isSpy = room.spies.includes(player.id);
-    console.log(`Oyuncu ${player.name} (${player.id}): ${isSpy ? 'CASUS' : 'NORMAL'}, Bağlantı: ${connection ? 'VAR' : 'YOK'}`);
-    
-    if (connection && connection.readyState === WebSocket.OPEN) {
-      const message = {
-        type: 'wordShown',
-        word: isSpy ? null : room.word,
-        category: room.category,
-        isSpy: isSpy,
-        spyCount: room.showSpyCountToPlayers ? room.spyCount : null,
-        otherSpies: (isSpy && room.allowSpyDiscussion) ? 
-          room.spies.filter(spyId => spyId !== player.id)
-                   .map(spyId => room.players.find(p => p.id === spyId).name) : null,
-        spyHintsEnabled: room.spyHintsEnabled,
-        room: {
-          code: room.code,
-          players: room.players,
-          hostId: room.hostId,
-          state: room.state,
-          category: room.category
-        }
-      };
-      console.log(`${player.name}'e mesaj gönderiliyor:`, message);
-      connection.send(JSON.stringify(message));
-    } else {
-      console.log(`${player.name} için bağlantı yok veya kapalı`);
-    }
-  });
 }
 
 // Tartışmayı başlat
