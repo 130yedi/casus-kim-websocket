@@ -145,6 +145,10 @@ wss.on('connection', (ws) => {
         case 'leaveRoom':
           handleLeaveRoom(ws, message);
           break;
+        case 'ping':
+          // Heartbeat ping'ine pong ile yanıt ver
+          ws.send(JSON.stringify({ type: 'pong' }));
+          break;
         default:
           console.log('Bilinmeyen mesaj tipi:', message.type);
       }
