@@ -102,4 +102,4 @@ Prodüksiyon ortamına deploy etmek için:
 Örnek prodüksiyon URL'si:
 ```dart
 static const String _serverUrl = 'wss://your-server.herokuapp.com';
-``` 
+```
